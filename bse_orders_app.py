@@ -1,5 +1,5 @@
 import requests, pandas as pd, time, re
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 import streamlit as st
 
 # --------------------
@@ -31,7 +31,6 @@ def _call_once(s: requests.Session, url: str, params: dict):
     ct = r.headers.get("content-type","")
     if "application/json" not in ct:
         return [], None, {"blocked": True, "ct": ct, "status": r.status_code}
-
     data = r.json()
     rows = data.get("Table") or []
     total = None
@@ -41,11 +40,8 @@ def _call_once(s: requests.Session, url: str, params: dict):
         pass
     return rows, total, {}
 
-def _fetch_chunk_resilient(s, d1: str, d2: str, log):
-    """
-    Try multiple endpoint/param variants for one date window d1..d2.
-    Returns list[dict] rows (maybe empty).
-    """
+def _fetch_single_range(s, d1: str, d2: str, log):
+    """Fetch full date range without chunking."""
     search_opts = ["", "P"]
     seg_opts    = ["C", "E"]
     subcat_opts = ["", "-1"]
@@ -58,6 +54,7 @@ def _fetch_chunk_resilient(s, d1: str, d2: str, log):
                 for subcategory in subcat_opts:
                     for pageno_key in pageno_keys:
                         for scrip_key in scrip_keys:
+
                             params = {
                                 pageno_key: 1,
                                 "strCat": "-1",
@@ -66,32 +63,26 @@ def _fetch_chunk_resilient(s, d1: str, d2: str, log):
                                 scrip_key: "",
                                 "strSearch": strSearch,
                                 "strType": strType,
+                                "subcategory": subcategory,
                             }
-                            params["subcategory"] = subcategory
 
-                            log.append(
-                                f"[{d1}-{d2}] {ep.split('/api/')[-1]} | "
-                                f"strType={strType} | strSearch='{strSearch}' | "
-                                f"subcat='{subcategory}' | keys={pageno_key}/{scrip_key}"
-                            )
+                            log.append(f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType}")
 
                             rows_acc = []
                             page = 1
+
                             while True:
                                 rows, total, meta = _call_once(s, ep, params)
+
                                 if meta.get("blocked"):
-                                    log.append(
-                                        f"   non-JSON ({meta['ct']}, {meta['status']}); "
-                                        "re-warm + retry once"
-                                    )
+                                    log.append("Blocked: retry warmup")
                                     try:
-                                        s.get(HOME, timeout=15)
-                                        s.get(CORP, timeout=15)
-                                    except Exception:
+                                        s.get(HOME, timeout=10)
+                                        s.get(CORP, timeout=10)
+                                    except:
                                         pass
                                     rows, total, meta = _call_once(s, ep, params)
                                     if meta.get("blocked"):
-                                        log.append("   still non-JSON; breaking variant.")
                                         break
 
                                 if page == 1 and total == 0 and not rows:
@@ -101,54 +92,48 @@ def _fetch_chunk_resilient(s, d1: str, d2: str, log):
                                     break
 
                                 rows_acc.extend(rows)
-                                params[pageno_key] = params[pageno_key] + 1
+                                params[pageno_key] += 1
                                 page += 1
-                                time.sleep(0.25)
 
                                 if total and len(rows_acc) >= total:
                                     break
 
                             if rows_acc:
                                 return rows_acc
+
     return []
 
-def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, throttle=0.3, log=None):
-    """
-    Resilient fetcher with multi-endpoint & header hardening.
-    Calls BSE once for the full date range start_yyyymmdd..end_yyyymmdd.
-    Returns DataFrame with deduped, sorted announcements.
-    """
+def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=None):
+    """Fetch full date range once — NO throttle, NO chunks."""
     if log is None:
         log = []
 
-    assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
-    assert start_yyyymmdd <= end_yyyymmdd
-
     s = requests.Session()
     s.headers.update(BASE_HEADERS)
+
+    # warmup
     try:
         s.get(HOME, timeout=15)
         s.get(CORP, timeout=15)
-    except Exception:
+    except:
         pass
 
-    # Single call for the full range (no chunk loop)
-    log.append(f"Full range {start_yyyymmdd}..{end_yyyymmdd}")
-    all_rows = _fetch_chunk_resilient(s, start_yyyymmdd, end_yyyymmdd, log)
-    time.sleep(throttle)
+    log.append(f"Full fetch: {start_yyyymmdd}..{end_yyyymmdd}")
+
+    all_rows = _fetch_single_range(s, start_yyyymmdd, end_yyyymmdd, log)
 
     if not all_rows:
-        return pd.DataFrame(
-            columns=["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-                     "NEWS_DT","ATTACHMENTNAME","NSURL"]
-        )
+        return pd.DataFrame(columns=[
+            "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
+            "NEWS_DT","ATTACHMENTNAME","NSURL"
+        ])
 
-    base_cols = [
-        "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-        "NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"
-    ]
+    base_cols = ["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
+                 "NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"]
+
     seen = set(base_cols)
     extra_cols = []
+
     for r in all_rows:
         for k in r.keys():
             if k not in seen:
@@ -157,7 +142,9 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, throt
 
     df = pd.DataFrame(all_rows, columns=base_cols + extra_cols)
 
-    keys = [c for c in ["NSURL","NEWSID","ATTACHMENTNAME","HEADLINE"] if c in df.columns]
+    keys = ["NSURL", "NEWSID", "ATTACHMENTNAME", "HEADLINE"]
+    keys = [k for k in keys if k in df.columns]
+
     if keys:
         df = df.drop_duplicates(subset=keys)
 
@@ -168,226 +155,74 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, throt
     return df
 
 # --------------------
-# Text filters
+# Filters: Orders + Capex
 # --------------------
 
 ORDER_KEYWORDS = ["order","contract","bagged","supply","purchase order"]
 ORDER_REGEX = re.compile(r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE)
 
 CAPEX_KEYWORDS = [
-    "capex",
-    "capital expenditure",
-    "capital expenditures",
-    "capacity expansion",
-    "expansion of capacity",
-    "expansion project",
-    "greenfield project",
-    "brownfield project",
-    "greenfield expansion",
-    "brownfield expansion",
-    "new plant",
-    "new manufacturing facility",
-    "new manufacturing unit",
-    "new factory",
-    "setting up a plant",
-    "setting up new plant",
-    "setting up a new unit",
-    "setting up manufacturing facility",
-    "production capacity",
-    "increase in capacity",
-    "enhancement of capacity",
-    "capital investment",
-    "investment of rs",
-    "to invest rs",
-    "board approves capex",
-    "board approves expansion",
-    "board approves investment",
+    "capex","capital expenditure","capacity expansion",
+    "new plant","manufacturing facility","brownfield","greenfield",
+    "setting up a plant","increase in capacity","expansion"
 ]
-CAPEX_REGEX = re.compile(r"(?:" + "|".join(map(re.escape, CAPEX_KEYWORDS)) + r")", re.IGNORECASE)
+CAPEX_REGEX = re.compile("|".join(CAPEX_KEYWORDS), re.IGNORECASE)
 
-def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a trimmed dataframe with only 'order-like' announcements and a click-through link column."""
-    if df.empty:
-        return df
-
-    textcol = "HEADLINE" if "HEADLINE" in df.columns else "NEWSSUB"
-    mask = df[textcol].fillna("").str.contains(ORDER_REGEX)
-    out = df.loc[mask, ["SLONGNAME", "HEADLINE", "NEWS_DT", "NSURL"]].copy()
-    out = out.rename(columns={
-        "SLONGNAME":"Company",
-        "HEADLINE":"Announcement",
-        "NEWS_DT":"Date",
-        "NSURL":"Link"
-    })
-    out["Company"] = out["Company"].fillna("")
-    out["Announcement"] = out["Announcement"].fillna("")
+def enrich_orders(df):
+    if df.empty: return df
+    mask = df["HEADLINE"].fillna("").str.contains(ORDER_REGEX)
+    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWS_DT","NSURL"]].copy()
+    out.columns = ["Company","Announcement","Date","Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
-    out = out.sort_values("Date", ascending=False)
-    return out
+    return out.sort_values("Date", ascending=False)
 
-def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return a trimmed dataframe with only capex / expansion / new plant announcements.
-    Uses both HEADLINE and NEWSSUB.
-    """
-    if df.empty:
-        return df
-
-    headlines = df.get("HEADLINE", pd.Series([""] * len(df))).fillna("")
-    subs      = df.get("NEWSSUB", pd.Series([""] * len(df))).fillna("")
-    combined  = (headlines + " " + subs).astype(str)
-
+def enrich_capex(df):
+    if df.empty: return df
+    combined = (df["HEADLINE"].fillna("") + " " + df["NEWSSUB"].fillna(""))
     mask = combined.str.contains(CAPEX_REGEX, na=False)
-    out = df.loc[mask, ["SLONGNAME", "HEADLINE", "NEWS_DT", "NSURL"]].copy()
-    out = out.rename(columns={
-        "SLONGNAME":"Company",
-        "HEADLINE":"Announcement",
-        "NEWS_DT":"Date",
-        "NSURL":"Link"
-    })
-    out["Company"] = out["Company"].fillna("")
-    out["Announcement"] = out["Announcement"].fillna("")
+    out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWS_DT","NSURL"]].copy()
+    out.columns = ["Company","Announcement","Date","Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
-    out = out.sort_values("Date", ascending=False)
-    return out
+    return out.sort_values("Date", ascending=False)
 
 # --------------------
-# Streamlit App
+# Streamlit UI
 # --------------------
 
-st.set_page_config(page_title="BSE Order & Capex Announcements", page_icon="📣", layout="wide")
+st.set_page_config(page_title="BSE Order & Capex Announcements", layout="wide")
+st.title("📣 BSE Order & Capex Announcements Finder")
 
-st.markdown(
-    """
-    <style>
-    .title {font-size: 2.1rem; font-weight: 700; margin-bottom: .25rem;}
-    .subtitle {color: #5b6b7a; margin-bottom: 1.25rem;}
-    .footer {text-align:center; margin-top: 2rem; color: #6b7280;}
-    .metric-card {padding: 1rem; background: #0f172a0f; border: 1px solid #0f172a1a; border-radius: 14px;}
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input("Start Date", value=date(2025,1,1))
+with col2:
+    end_date = st.date_input("End Date", value=date.today())
 
-st.markdown('<div class="title">📣 BSE Order & Capex Announcements Finder</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">Enter a date range to fetch BSE corporate announcements, then filter down to order/contract and capex/expansion related items.</div>',
-    unsafe_allow_html=True
-)
-
-with st.container():
-    col1, col2 = st.columns([1.2, 1.2])
-    with col1:
-        start_date = st.date_input("Start date", value=date(2025,1,1), min_value=date(2015,1,1))
-    with col2:
-        end_date = st.date_input("End date", value=date.today())
-
-
-run = st.button("🔎 Fetch announcements", type="primary", use_container_width=True)
+run = st.button("🔎 Fetch Announcements", use_container_width=True)
 
 if run:
-    if start_date > end_date:
-        st.error("Start date cannot be after End date.")
-    else:
-        ds = start_date.strftime("%Y%m%d")
-        de = end_date.strftime("%Y%m%d")
-        logs = []
-        with st.spinner(f"Fetching announcements from {ds} to {de} ..."):
-            df = fetch_bse_announcements_strict(
-                ds,
-                de,
-                throttle=float(throttle),
-                log=logs
-            )
+    ds = start_date.strftime("%Y%m%d")
+    de = end_date.strftime("%Y%m%d")
+    logs = []
 
-        orders_df = enrich_orders(df)
-        capex_df  = enrich_capex(df)
+    with st.spinner("Fetching..."):
+        df = fetch_bse_announcements_strict(ds, de, log=logs)
 
-        total_rows = len(df)
-        order_rows = len(orders_df)
-        capex_rows = len(capex_df)
+    orders_df = enrich_orders(df)
+    capex_df = enrich_capex(df)
 
-        # Metrics
-        mcol1, mcol2, mcol3, mcol4 = st.columns([1,1,1,1])
-        with mcol1:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Total Announcements", f"{total_rows:,}")
-            st.markdown('</div>', unsafe_allow_html=True)
-        with mcol2:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Order-like Announcements", f"{order_rows:,}")
-            st.markdown('</div>', unsafe_allow_html=True)
-        with mcol3:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Capex/Expansion Announcements", f"{capex_rows:,}")
-            st.markdown('</div>', unsafe_allow_html=True)
-        with mcol4:
-            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.metric("Date Range (days)", f"{(end_date - start_date).days + 1:,}")
-            st.markdown('</div>', unsafe_allow_html=True)
+    st.metric("Total Announcements", len(df))
+    st.metric("Order Announcements", len(orders_df))
+    st.metric("Capex Announcements", len(capex_df))
 
-        st.divider()
+    tab_orders, tab_capex, tab_all = st.tabs(["📦 Orders", "🏭 Capex", "📄 All"])
 
-        if total_rows == 0:
-            st.warning("No announcements found in this window. Try adjusting the date range.")
-        else:
-            tab_orders, tab_capex, tab_all = st.tabs(
-                ["📦 Orders / Contracts", "🏭 Capex / Expansion", "🧾 All Announcements"]
-            )
+    with tab_orders:
+        st.dataframe(orders_df, use_container_width=True)
 
-            with tab_orders:
-                if order_rows == 0:
-                    st.warning("No order-like announcements found in this window.")
-                else:
-                    st.subheader("Order / Contract Announcements")
-                    st.dataframe(
-                        orders_df,
-                        use_container_width=True,
-                        column_config={
-                            "Link": st.column_config.LinkColumn("Announcement Link", display_text="Open"),
-                            "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
-                        },
-                        hide_index=True,
-                    )
+    with tab_capex:
+        st.dataframe(capex_df, use_container_width=True)
 
-                    csv_orders = orders_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "⬇️ Download order results (CSV)",
-                        csv_orders,
-                        file_name=f"bse_orders_{ds}_{de}.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
+    with tab_all:
+        st.dataframe(df, use_container_width=True)
 
-            with tab_capex:
-                if capex_rows == 0:
-                    st.warning("No capex/expansion announcements found in this window.")
-                else:
-                    st.subheader("Capex / Expansion Announcements")
-                    st.dataframe(
-                        capex_df,
-                        use_container_width=True,
-                        column_config={
-                            "Link": st.column_config.LinkColumn("Announcement Link", display_text="Open"),
-                            "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
-                        },
-                        hide_index=True,
-                    )
-
-                    csv_capex = capex_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "⬇️ Download capex results (CSV)",
-                        csv_capex,
-                        file_name=f"bse_capex_{ds}_{de}.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-
-            with tab_all:
-                st.subheader("All Announcements (raw)")
-                st.dataframe(df, use_container_width=True)
-
-        if show_logs:
-            st.divider()
-            st.subheader("Fetch logs")
-            st.code("\n".join(logs) if logs else "No logs.")
