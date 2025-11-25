@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, date
 import streamlit as st
 
 # --------------------
-# Backend (resilient fetcher) - from your code, slightly wrapped for UI integration
+# Backend (resilient fetcher)
 # --------------------
 
 HOME = "https://www.bseindia.com/"
@@ -165,18 +165,74 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, chunk
     return df
 
 # --------------------
-# UI Helpers
+# Text filters
 # --------------------
 
-KEYWORDS = ["order","contract","bagged","supply","purchase order"]
-ORDER_REGEX = re.compile(r"\b(?:" + "|".join(map(re.escape, KEYWORDS)) + r")\b", re.IGNORECASE)
+# Orders / contracts (as you had)
+ORDER_KEYWORDS = ["order","contract","bagged","supply","purchase order"]
+ORDER_REGEX = re.compile(r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE)
+
+# Capex / expansion indicators
+CAPEX_KEYWORDS = [
+    "capex",
+    "capital expenditure",
+    "capital expenditures",
+    "capacity expansion",
+    "expansion of capacity",
+    "expansion project",
+    "greenfield project",
+    "brownfield project",
+    "greenfield expansion",
+    "brownfield expansion",
+    "new plant",
+    "new manufacturing facility",
+    "new manufacturing unit",
+    "new factory",
+    "setting up a plant",
+    "setting up new plant",
+    "setting up a new unit",
+    "setting up manufacturing facility",
+    "production capacity",
+    "increase in capacity",
+    "enhancement of capacity",
+    "capital investment",
+    "investment of rs",
+    "to invest rs",
+    "board approves capex",
+    "board approves expansion",
+    "board approves investment",
+]
+CAPEX_REGEX = re.compile(r"(?:" + "|".join(map(re.escape, CAPEX_KEYWORDS)) + r")", re.IGNORECASE)
 
 def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
     """Return a trimmed dataframe with only 'order-like' announcements and a click-through link column."""
     if df.empty:
         return df
+
     textcol = "HEADLINE" if "HEADLINE" in df.columns else "NEWSSUB"
     mask = df[textcol].fillna("").str.contains(ORDER_REGEX)
+    out = df.loc[mask, ["SLONGNAME", "HEADLINE", "NEWS_DT", "NSURL"]].copy()
+    out = out.rename(columns={"SLONGNAME":"Company", "HEADLINE":"Announcement", "NEWS_DT":"Date", "NSURL":"Link"})
+    out["Company"] = out["Company"].fillna("")
+    out["Announcement"] = out["Announcement"].fillna("")
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
+    out = out.sort_values("Date", ascending=False)
+    return out
+
+def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a trimmed dataframe with only capex / expansion / new plant announcements.
+    Uses both HEADLINE and NEWSSUB to avoid missing phrasing that appears only in the body.
+    """
+    if df.empty:
+        return df
+
+    # Safely build a combined text series
+    headlines = df.get("HEADLINE", pd.Series([""] * len(df))).fillna("")
+    subs      = df.get("NEWSSUB", pd.Series([""] * len(df))).fillna("")
+    combined  = (headlines + " " + subs).astype(str)
+
+    mask = combined.str.contains(CAPEX_REGEX, na=False)
     out = df.loc[mask, ["SLONGNAME", "HEADLINE", "NEWS_DT", "NSURL"]].copy()
     out = out.rename(columns={"SLONGNAME":"Company", "HEADLINE":"Announcement", "NEWS_DT":"Date", "NSURL":"Link"})
     out["Company"] = out["Company"].fillna("")
@@ -189,7 +245,7 @@ def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
 # Streamlit App
 # --------------------
 
-st.set_page_config(page_title="BSE Order Announcements", page_icon="📣", layout="wide")
+st.set_page_config(page_title="BSE Order & Capex Announcements", page_icon="📣", layout="wide")
 
 st.markdown(
     """
@@ -203,8 +259,11 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.markdown('<div class="title">📣 BSE Order/Contract Announcements Finder</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Enter a date range to fetch BSE corporate announcements and filter to order-like items. Click any link to open the announcement.</div>', unsafe_allow_html=True)
+st.markdown('<div class="title">📣 BSE Order & Capex Announcements Finder</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="subtitle">Enter a date range to fetch BSE corporate announcements, then filter down to order/contract and capex/expansion related items.</div>',
+    unsafe_allow_html=True
+)
 
 with st.container():
     col1, col2, col3 = st.columns([1.2,1.2,0.8])
@@ -233,11 +292,14 @@ if run:
             df = fetch_bse_announcements_strict(ds, de, chunk_days=int(chunk_days), throttle=float(throttle), log=logs)
 
         orders_df = enrich_orders(df)
+        capex_df  = enrich_capex(df)
+
         total_rows = len(df)
         order_rows = len(orders_df)
+        capex_rows = len(capex_df)
 
         # Metrics
-        mcol1, mcol2, mcol3 = st.columns([1,1,1])
+        mcol1, mcol2, mcol3, mcol4 = st.columns([1,1,1,1])
         with mcol1:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
             st.metric("Total Announcements", f"{total_rows:,}")
@@ -248,37 +310,75 @@ if run:
             st.markdown('</div>', unsafe_allow_html=True)
         with mcol3:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric("Capex/Expansion Announcements", f"{capex_rows:,}")
+            st.markdown('</div>', unsafe_allow_html=True)
+        with mcol4:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
             st.metric("Date Range (days)", f"{(end_date - start_date).days + 1:,}")
             st.markdown('</div>', unsafe_allow_html=True)
 
         st.divider()
 
-        if order_rows == 0:
-            st.warning("No order-like announcements found in this window. Consider narrowing the dates or reducing chunk size.")
+        if total_rows == 0:
+            st.warning("No announcements found in this window. Try adjusting the date range or chunk size.")
         else:
-            st.subheader("Order/Contract Announcements")
-            st.dataframe(
-                orders_df,
-                use_container_width=True,
-                column_config={
-                    "Link": st.column_config.LinkColumn("Announcement Link", display_text="Open"),
-                    "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
-                },
-                hide_index=True,
+            tab_orders, tab_capex, tab_all = st.tabs(
+                ["📦 Orders / Contracts", "🏭 Capex / Expansion", "🧾 All Announcements"]
             )
 
-            csv = orders_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download filtered results (CSV)",
-                csv,
-                file_name=f"bse_orders_{ds}_{de}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            with tab_orders:
+                if order_rows == 0:
+                    st.warning("No order-like announcements found in this window.")
+                else:
+                    st.subheader("Order / Contract Announcements")
+                    st.dataframe(
+                        orders_df,
+                        use_container_width=True,
+                        column_config={
+                            "Link": st.column_config.LinkColumn("Announcement Link", display_text="Open"),
+                            "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+                        },
+                        hide_index=True,
+                    )
+
+                    csv_orders = orders_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Download order results (CSV)",
+                        csv_orders,
+                        file_name=f"bse_orders_{ds}_{de}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+
+            with tab_capex:
+                if capex_rows == 0:
+                    st.warning("No capex/expansion announcements found in this window.")
+                else:
+                    st.subheader("Capex / Expansion Announcements")
+                    st.dataframe(
+                        capex_df,
+                        use_container_width=True,
+                        column_config={
+                            "Link": st.column_config.LinkColumn("Announcement Link", display_text="Open"),
+                            "Date": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+                        },
+                        hide_index=True,
+                    )
+
+                    csv_capex = capex_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Download capex results (CSV)",
+                        csv_capex,
+                        file_name=f"bse_capex_{ds}_{de}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+
+            with tab_all:
+                st.subheader("All Announcements (raw)")
+                st.dataframe(df, use_container_width=True)
 
         if show_logs:
             st.divider()
             st.subheader("Fetch logs")
             st.code("\n".join(logs) if logs else "No logs.")
-
-st.markdown('<div class="footer">Made with ❤️ by Eshaan</div>', unsafe_allow_html=True)
