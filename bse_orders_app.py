@@ -43,7 +43,7 @@ def _call_once(s: requests.Session, url: str, params: dict):
 
 def _fetch_chunk_resilient(s, d1: str, d2: str, log):
     """
-    Try multiple endpoint/param variants for one small date window.
+    Try multiple endpoint/param variants for one date window d1..d2.
     Returns list[dict] rows (maybe empty).
     """
     search_opts = ["", "P"]
@@ -69,14 +69,21 @@ def _fetch_chunk_resilient(s, d1: str, d2: str, log):
                             }
                             params["subcategory"] = subcategory
 
-                            log.append(f"[{d1}-{d2}] {ep.split('/api/')[-1]} | strType={strType} | strSearch='{strSearch}' | subcat='{subcategory}' | keys={pageno_key}/{scrip_key}")
+                            log.append(
+                                f"[{d1}-{d2}] {ep.split('/api/')[-1]} | "
+                                f"strType={strType} | strSearch='{strSearch}' | "
+                                f"subcat='{subcategory}' | keys={pageno_key}/{scrip_key}"
+                            )
 
                             rows_acc = []
                             page = 1
                             while True:
                                 rows, total, meta = _call_once(s, ep, params)
                                 if meta.get("blocked"):
-                                    log.append(f"   non-JSON ({meta['ct']}, {meta['status']}); re-warm + retry once")
+                                    log.append(
+                                        f"   non-JSON ({meta['ct']}, {meta['status']}); "
+                                        "re-warm + retry once"
+                                    )
                                     try:
                                         s.get(HOME, timeout=15)
                                         s.get(CORP, timeout=15)
@@ -105,9 +112,10 @@ def _fetch_chunk_resilient(s, d1: str, d2: str, log):
                                 return rows_acc
     return []
 
-def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, chunk_days=5, throttle=0.3, log=None):
+def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, throttle=0.3, log=None):
     """
-    Range-aware, resilient fetcher with multi-endpoint & header hardening.
+    Resilient fetcher with multi-endpoint & header hardening.
+    Calls BSE once for the full date range start_yyyymmdd..end_yyyymmdd.
     Returns DataFrame with deduped, sorted announcements.
     """
     if log is None:
@@ -124,33 +132,28 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, chunk
     except Exception:
         pass
 
-    start_dt = datetime.strptime(start_yyyymmdd, "%Y%m%d").date()
-    end_dt   = datetime.strptime(end_yyyymmdd, "%Y%m%d").date()
-
-    all_rows = []
-    day = start_dt
-    while day <= end_dt:
-        chunk_start = day
-        chunk_end   = min(day + timedelta(days=chunk_days-1), end_dt)
-        ds = chunk_start.strftime("%Y%m%d")
-        de = chunk_end.strftime("%Y%m%d")
-        log.append(f"Chunk {ds}..{de}")
-        rows = _fetch_chunk_resilient(s, ds, de, log)
-        if rows:
-            all_rows.extend(rows)
-        time.sleep(throttle)
-        day = chunk_end + timedelta(days=1)
+    # Single call for the full range (no chunk loop)
+    log.append(f"Full range {start_yyyymmdd}..{end_yyyymmdd}")
+    all_rows = _fetch_chunk_resilient(s, start_yyyymmdd, end_yyyymmdd, log)
+    time.sleep(throttle)
 
     if not all_rows:
-        return pd.DataFrame(columns=["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","ATTACHMENTNAME","NSURL"])
+        return pd.DataFrame(
+            columns=["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
+                     "NEWS_DT","ATTACHMENTNAME","NSURL"]
+        )
 
-    base_cols = ["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB","NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"]
+    base_cols = [
+        "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
+        "NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"
+    ]
     seen = set(base_cols)
     extra_cols = []
     for r in all_rows:
         for k in r.keys():
             if k not in seen:
-                extra_cols.append(k); seen.add(k)
+                extra_cols.append(k)
+                seen.add(k)
 
     df = pd.DataFrame(all_rows, columns=base_cols + extra_cols)
 
@@ -168,11 +171,9 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, chunk
 # Text filters
 # --------------------
 
-# Orders / contracts (as you had)
 ORDER_KEYWORDS = ["order","contract","bagged","supply","purchase order"]
 ORDER_REGEX = re.compile(r"\b(?:" + "|".join(map(re.escape, ORDER_KEYWORDS)) + r")\b", re.IGNORECASE)
 
-# Capex / expansion indicators
 CAPEX_KEYWORDS = [
     "capex",
     "capital expenditure",
@@ -212,7 +213,12 @@ def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
     textcol = "HEADLINE" if "HEADLINE" in df.columns else "NEWSSUB"
     mask = df[textcol].fillna("").str.contains(ORDER_REGEX)
     out = df.loc[mask, ["SLONGNAME", "HEADLINE", "NEWS_DT", "NSURL"]].copy()
-    out = out.rename(columns={"SLONGNAME":"Company", "HEADLINE":"Announcement", "NEWS_DT":"Date", "NSURL":"Link"})
+    out = out.rename(columns={
+        "SLONGNAME":"Company",
+        "HEADLINE":"Announcement",
+        "NEWS_DT":"Date",
+        "NSURL":"Link"
+    })
     out["Company"] = out["Company"].fillna("")
     out["Announcement"] = out["Announcement"].fillna("")
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
@@ -222,19 +228,23 @@ def enrich_orders(df: pd.DataFrame) -> pd.DataFrame:
 def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
     """
     Return a trimmed dataframe with only capex / expansion / new plant announcements.
-    Uses both HEADLINE and NEWSSUB to avoid missing phrasing that appears only in the body.
+    Uses both HEADLINE and NEWSSUB.
     """
     if df.empty:
         return df
 
-    # Safely build a combined text series
     headlines = df.get("HEADLINE", pd.Series([""] * len(df))).fillna("")
     subs      = df.get("NEWSSUB", pd.Series([""] * len(df))).fillna("")
     combined  = (headlines + " " + subs).astype(str)
 
     mask = combined.str.contains(CAPEX_REGEX, na=False)
     out = df.loc[mask, ["SLONGNAME", "HEADLINE", "NEWS_DT", "NSURL"]].copy()
-    out = out.rename(columns={"SLONGNAME":"Company", "HEADLINE":"Announcement", "NEWS_DT":"Date", "NSURL":"Link"})
+    out = out.rename(columns={
+        "SLONGNAME":"Company",
+        "HEADLINE":"Announcement",
+        "NEWS_DT":"Date",
+        "NSURL":"Link"
+    })
     out["Company"] = out["Company"].fillna("")
     out["Announcement"] = out["Announcement"].fillna("")
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
@@ -266,14 +276,13 @@ st.markdown(
 )
 
 with st.container():
-    col1, col2, col3 = st.columns([1.2,1.2,0.8])
+    col1, col2 = st.columns([1.2, 1.2])
     with col1:
         start_date = st.date_input("Start date", value=date(2025,1,1), min_value=date(2015,1,1))
     with col2:
         end_date = st.date_input("End date", value=date.today())
-    with col3:
-        chunk_days = st.number_input("Chunk size (days)", min_value=1, max_value=7, value=5, step=1)
 
+# Advanced options (still keep throttle + logs)
 advanced = st.expander("Advanced options", expanded=False)
 with advanced:
     throttle = st.slider("Request throttle (seconds)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
@@ -289,7 +298,12 @@ if run:
         de = end_date.strftime("%Y%m%d")
         logs = []
         with st.spinner(f"Fetching announcements from {ds} to {de} ..."):
-            df = fetch_bse_announcements_strict(ds, de, chunk_days=int(chunk_days), throttle=float(throttle), log=logs)
+            df = fetch_bse_announcements_strict(
+                ds,
+                de,
+                throttle=float(throttle),
+                log=logs
+            )
 
         orders_df = enrich_orders(df)
         capex_df  = enrich_capex(df)
@@ -320,7 +334,7 @@ if run:
         st.divider()
 
         if total_rows == 0:
-            st.warning("No announcements found in this window. Try adjusting the date range or chunk size.")
+            st.warning("No announcements found in this window. Try adjusting the date range.")
         else:
             tab_orders, tab_capex, tab_all = st.tabs(
                 ["📦 Orders / Contracts", "🏭 Capex / Expansion", "🧾 All Announcements"]
