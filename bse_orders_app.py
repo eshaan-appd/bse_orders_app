@@ -150,7 +150,10 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=N
 
     if "NEWS_DT" in df.columns:
         df["_NEWS_DT_PARSED"] = pd.to_datetime(df["NEWS_DT"], errors="coerce", dayfirst=True)
-        df = df.sort_values("_NEWS_DT_PARSED", ascending=False).drop(columns=["_NEWS_DT_PARSED"])
+        df = (
+        df.sort_values("_NEWS_DT_PARSED", ascending=False)
+          .drop(columns=["_NEWS_DT_PARSED"])
+          .reset_index(drop=True))
 
     return df
 
@@ -174,7 +177,7 @@ def enrich_orders(df):
     out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWS_DT","NSURL"]].copy()
     out.columns = ["Company","Announcement","Date","Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
-    return out.sort_values("Date", ascending=False)
+    return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
 def enrich_capex(df):
     if df.empty: return df
@@ -183,7 +186,7 @@ def enrich_capex(df):
     out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWS_DT","NSURL"]].copy()
     out.columns = ["Company","Announcement","Date","Link"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce", dayfirst=True)
-    return out.sort_values("Date", ascending=False)
+    return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
 # --------------------
 # Streamlit UI
