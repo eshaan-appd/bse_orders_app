@@ -282,11 +282,6 @@ with st.container():
     with col2:
         end_date = st.date_input("End date", value=date.today())
 
-# Advanced options (still keep throttle + logs)
-advanced = st.expander("Advanced options", expanded=False)
-with advanced:
-    throttle = st.slider("Request throttle (seconds)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
-    show_logs = st.checkbox("Show fetch logs", value=False)
 
 run = st.button("🔎 Fetch announcements", type="primary", use_container_width=True)
 
