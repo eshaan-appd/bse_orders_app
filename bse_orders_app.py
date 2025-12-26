@@ -1,5 +1,5 @@
 import requests, pandas as pd, time, re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import streamlit as st
 
 # --------------------
@@ -41,7 +41,8 @@ def _call_once(s: requests.Session, url: str, params: dict):
     return rows, total, {}
 
 def _fetch_single_range(s, d1: str, d2: str, log):
-    """Fetch full date range without chunking."""
+    """Fetch full date range without chunking (not used in the new multi-day loop,
+    but kept here in case you still want one-shot behaviour elsewhere)."""
     search_opts = ["", "P"]
     seg_opts    = ["C", "E"]
     subcat_opts = ["", "-1"]
@@ -103,8 +104,22 @@ def _fetch_single_range(s, d1: str, d2: str, log):
 
     return []
 
+def _norm(x):
+    """Basic normalisation for text comparison."""
+    if x is None:
+        return ""
+    return str(x).strip()
+
+def _first_col(df: pd.DataFrame, candidates):
+    """Return the first existing column from a list of candidate names."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
 def fetch_bse_announcements_strict(start_yyyymmdd: str,
                                    end_yyyymmdd: str,
+                                   log=None,
                                    verbose: bool = True,
                                    request_timeout: int = 25) -> pd.DataFrame:
     """
@@ -112,7 +127,7 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
     but call the BSE API **day-by-day**, because it behaves most reliably when
     strPrevDate == strToDate.
 
-    Logic preserved from the original version:
+    Logic preserved from your earlier version:
     - Use AnnSubCategoryGetData endpoint.
     - Try multiple (subcategory, strSearch) variants.
     - Build a wide DataFrame from all keys.
@@ -144,7 +159,6 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
     except Exception:
         pass
 
-    # Same variants you had before
     variants = [
         {"subcategory": "-1", "strSearch": "P"},
         {"subcategory": "-1", "strSearch": ""},
@@ -162,7 +176,11 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
     while cur <= end_dt:
         day_str = cur.strftime("%Y%m%d")
         if verbose:
-            st.write(f"Fetching BSE announcements for {day_str}...")
+            # On Streamlit, prefer logging via st.write only if you really want to see it.
+            # Here we just append to log if provided.
+            pass
+        if log is not None:
+            log.append(f"Fetching BSE announcements for {day_str}...")
 
         day_rows: list[dict] = []
 
@@ -184,15 +202,15 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
                 try:
                     r = s.get(url, params=params, timeout=request_timeout)
                 except requests.exceptions.RequestException as e:
-                    if verbose:
-                        st.warning(f"[{day_str} {v}] request error on page {page}: {e}")
+                    if log is not None:
+                        log.append(f"[{day_str} {v}] request error on page {page}: {e}")
                     rows = []
                     break
 
                 ct = r.headers.get("content-type", "")
                 if "application/json" not in ct:
-                    if verbose:
-                        st.warning(f"[{day_str} {v}] non-JSON on page {page} (ct={ct}).")
+                    if log is not None:
+                        log.append(f"[{day_str} {v}] non-JSON on page {page} (ct={ct}).")
                     break
 
                 data = r.json()
@@ -288,7 +306,8 @@ CAPEX_KEYWORDS = [
 CAPEX_REGEX = re.compile("|".join(CAPEX_KEYWORDS), re.IGNORECASE)
 
 def enrich_orders(df):
-    if df.empty: return df
+    if df.empty:
+        return df
     mask = df["HEADLINE"].fillna("").str.contains(ORDER_REGEX)
     out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWS_DT","NSURL"]].copy()
     out.columns = ["Company","Announcement","Date","Link"]
@@ -296,7 +315,8 @@ def enrich_orders(df):
     return out.sort_values("Date", ascending=False).reset_index(drop=True)
 
 def enrich_capex(df):
-    if df.empty: return df
+    if df.empty:
+        return df
     combined = (df["HEADLINE"].fillna("") + " " + df["NEWSSUB"].fillna(""))
     mask = combined.str.contains(CAPEX_REGEX, na=False)
     out = df.loc[mask, ["SLONGNAME","HEADLINE","NEWS_DT","NSURL"]].copy()
@@ -344,4 +364,3 @@ if run:
 
     with tab_all:
         st.dataframe(df, use_container_width=True)
-
