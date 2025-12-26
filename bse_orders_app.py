@@ -41,7 +41,7 @@ def _call_once(s: requests.Session, url: str, params: dict):
     return rows, total, {}
 
 def _fetch_single_range(s, d1: str, d2: str, log):
-    """Fetch full date range without chunking (typically used per-day)."""
+    """Fetch full date range without chunking."""
     search_opts = ["", "P"]
     seg_opts    = ["C", "E"]
     subcat_opts = ["", "-1"]
@@ -66,7 +66,7 @@ def _fetch_single_range(s, d1: str, d2: str, log):
                                 "subcategory": subcategory,
                             }
 
-                            log.append(f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType} | {d1}..{d2}")
+                            log.append(f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType}")
 
                             rows_acc = []
                             page = 1
@@ -103,83 +103,175 @@ def _fetch_single_range(s, d1: str, d2: str, log):
 
     return []
 
-def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=None):
+def fetch_bse_announcements_strict(start_yyyymmdd: str,
+                                   end_yyyymmdd: str,
+                                   verbose: bool = True,
+                                   request_timeout: int = 25) -> pd.DataFrame:
     """
-    Fetch announcements between start_yyyymmdd and end_yyyymmdd (inclusive).
+    Fetch announcements between start_yyyymmdd and end_yyyymmdd (inclusive),
+    but call the BSE API **day-by-day**, because it behaves most reliably when
+    strPrevDate == strToDate.
 
-    CHANGE: instead of one big call for the whole range, we iterate
-    day-by-day (BSE is most reliable when strPrevDate == strToDate).
+    Logic preserved from the original version:
+    - Use AnnSubCategoryGetData endpoint.
+    - Try multiple (subcategory, strSearch) variants.
+    - Build a wide DataFrame from all keys.
+    - Filter to Category = 'Company Update'.
+    - Further filter to subcategory containing any of:
+      Acquisition | Amalgamation / Merger | Scheme of Arrangement | Joint Venture
     """
-    if log is None:
-        log = []
+    assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
+    assert start_yyyymmdd <= end_yyyymmdd
 
+    base_page = "https://www.bseindia.com/corporates/ann.html"
+    url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+
+    # One session for the whole range
     s = requests.Session()
-    s.headers.update(BASE_HEADERS)
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": base_page,
+        "X-Requested-With": "XMLHttpRequest",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
 
-    # warmup
+    # Warm-up calls (reduce chance of HTML / redirect responses)
     try:
-        s.get(HOME, timeout=15)
-        s.get(CORP, timeout=15)
-    except:
+        s.get(base_page, timeout=15)
+    except Exception:
         pass
 
-    # parse dates
-    start_dt = pd.to_datetime(start_yyyymmdd, format="%Y%m%d")
-    end_dt   = pd.to_datetime(end_yyyymmdd,   format="%Y%m%d")
+    # Same variants you had before
+    variants = [
+        {"subcategory": "-1", "strSearch": "P"},
+        {"subcategory": "-1", "strSearch": ""},
+        {"subcategory": "",   "strSearch": "P"},
+        {"subcategory": "",   "strSearch": ""},
+    ]
 
-    if end_dt < start_dt:
-        # invalid range -> empty frame
-        return pd.DataFrame(columns=[
-            "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-            "NEWS_DT","ATTACHMENTNAME","NSURL"
-        ])
+    all_rows: list[dict] = []
 
-    all_rows = []
+    # --- iterate day by day ---
+    start_dt = datetime.strptime(start_yyyymmdd, "%Y%m%d").date()
+    end_dt   = datetime.strptime(end_yyyymmdd,   "%Y%m%d").date()
 
     cur = start_dt
     while cur <= end_dt:
-        d_str = cur.strftime("%Y%m%d")
-        log.append(f"Day fetch: {d_str}..{d_str}")
-        rows = _fetch_single_range(s, d_str, d_str, log)
-        if rows:
-            all_rows.extend(rows)
-        cur += pd.Timedelta(days=1)
+        day_str = cur.strftime("%Y%m%d")
+        if verbose:
+            st.write(f"Fetching BSE announcements for {day_str}...")
 
+        day_rows: list[dict] = []
+
+        for v in variants:
+            params = {
+                "pageno": 1,
+                "strCat": "-1",
+                "subcategory": v["subcategory"],
+                "strPrevDate": day_str,
+                "strToDate": day_str,
+                "strSearch": v["strSearch"],
+                "strscrip": "",
+                "strType": "C",
+            }
+
+            rows, total, page = [], None, 1
+
+            while True:
+                try:
+                    r = s.get(url, params=params, timeout=request_timeout)
+                except requests.exceptions.RequestException as e:
+                    if verbose:
+                        st.warning(f"[{day_str} {v}] request error on page {page}: {e}")
+                    rows = []
+                    break
+
+                ct = r.headers.get("content-type", "")
+                if "application/json" not in ct:
+                    if verbose:
+                        st.warning(f"[{day_str} {v}] non-JSON on page {page} (ct={ct}).")
+                    break
+
+                data = r.json()
+                table = data.get("Table") or []
+                rows.extend(table)
+
+                if total is None:
+                    try:
+                        total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
+                    except Exception:
+                        total = None
+
+                if not table:
+                    break
+
+                params["pageno"] += 1
+                page += 1
+                time.sleep(0.25)
+
+                if total and len(rows) >= total:
+                    break
+
+            if rows:
+                # Got data for this day with this variant; no need to try others
+                day_rows.extend(rows)
+                break
+
+        if day_rows:
+            all_rows.extend(day_rows)
+
+        cur += timedelta(days=1)
+
+    # --- no data for entire range ---
     if not all_rows:
-        return pd.DataFrame(columns=[
-            "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-            "NEWS_DT","ATTACHMENTNAME","NSURL"
-        ])
+        return pd.DataFrame()
 
-    base_cols = ["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-                 "NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"]
-
-    seen = set(base_cols)
-    extra_cols = []
-
+    # --- build wide DataFrame from all rows ---
+    all_keys = set()
     for r in all_rows:
-        for k in r.keys():
-            if k not in seen:
-                extra_cols.append(k)
-                seen.add(k)
+        all_keys.update(r.keys())
+    df = pd.DataFrame(all_rows, columns=list(all_keys))
 
-    df = pd.DataFrame(all_rows, columns=base_cols + extra_cols)
+    # --- filter to Company Update + specific subcategories ---
+    def filter_announcements(df_in: pd.DataFrame, category_filter="Company Update") -> pd.DataFrame:
+        if df_in.empty:
+            return df_in.copy()
+        cat_col = _first_col(df_in, [
+            "CATEGORYNAME",
+            "CATEGORY",
+            "NEWS_CAT",
+            "NEWSCATEGORY",
+            "NEWS_CATEGORY",
+        ])
+        if not cat_col:
+            return df_in.copy()
+        df2 = df_in.copy()
+        df2["_cat_norm"] = df2[cat_col].map(lambda x: _norm(x).lower())
+        return df2.loc[df2["_cat_norm"] == _norm(category_filter).lower()].drop(columns=["_cat_norm"])
 
-    keys = ["NSURL", "NEWSID", "ATTACHMENTNAME", "HEADLINE"]
-    keys = [k for k in keys if k in df.columns]
+    df_filtered = filter_announcements(df, category_filter="Company Update")
+    if df_filtered.empty:
+        return df_filtered
 
-    if keys:
-        df = df.drop_duplicates(subset=keys)
-
-    if "NEWS_DT" in df.columns:
-        df["_NEWS_DT_PARSED"] = pd.to_datetime(df["NEWS_DT"], errors="coerce", dayfirst=True)
-        df = (
-            df.sort_values("_NEWS_DT_PARSED", ascending=False)
-              .drop(columns=["_NEWS_DT_PARSED"])
-              .reset_index(drop=True)
+    df_filtered = df_filtered.loc[
+        df_filtered
+        .filter(["NEWSSUB", "SUBCATEGORY", "SUBCATEGORYNAME", "NEWS_SUBCATEGORY", "NEWS_SUB"], axis=1)
+        .astype(str)
+        .apply(
+            lambda col: col.str.contains(
+                r"(Acquisition|Amalgamation\s*/\s*Merger|Scheme of Arrangement|Joint Venture)",
+                case=False,
+                na=False,
+            )
         )
+        .any(axis=1)
+    ]
 
-    return df
+    return df_filtered
+
 
 # --------------------
 # Filters: Orders + Capex
@@ -252,3 +344,4 @@ if run:
 
     with tab_all:
         st.dataframe(df, use_container_width=True)
+
