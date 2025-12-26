@@ -40,9 +40,12 @@ def _call_once(s: requests.Session, url: str, params: dict):
         pass
     return rows, total, {}
 
-def _fetch_single_range(s, d1: str, d2: str, log):
-    """Fetch full date range without chunking (not used in the new multi-day loop,
-    but kept here in case you still want one-shot behaviour elsewhere)."""
+def _fetch_single_range(s, d1: str, d2: str):
+    """
+    Legacy single-range fetcher (kept for completeness, not used in the
+    multi-day flow). Can be used if you ever want one-shot behaviour.
+    """
+    log = []
     search_opts = ["", "P"]
     seg_opts    = ["C", "E"]
     subcat_opts = ["", "-1"]
@@ -119,12 +122,10 @@ def _first_col(df: pd.DataFrame, candidates):
 
 def fetch_bse_announcements_strict(start_yyyymmdd: str,
                                    end_yyyymmdd: str,
-                                   log=None,
-                                   verbose: bool = True,
                                    request_timeout: int = 25) -> pd.DataFrame:
     """
     Fetch announcements between start_yyyymmdd and end_yyyymmdd (inclusive),
-    but call the BSE API **day-by-day**, because it behaves most reliably when
+    calling the BSE API **day-by-day**, because it behaves most reliably when
     strPrevDate == strToDate.
 
     Logic preserved from your earlier version:
@@ -175,12 +176,6 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
     cur = start_dt
     while cur <= end_dt:
         day_str = cur.strftime("%Y%m%d")
-        if verbose:
-            # On Streamlit, prefer logging via st.write only if you really want to see it.
-            # Here we just append to log if provided.
-            pass
-        if log is not None:
-            log.append(f"Fetching BSE announcements for {day_str}...")
 
         day_rows: list[dict] = []
 
@@ -202,15 +197,13 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
                 try:
                     r = s.get(url, params=params, timeout=request_timeout)
                 except requests.exceptions.RequestException as e:
-                    if log is not None:
-                        log.append(f"[{day_str} {v}] request error on page {page}: {e}")
+                    # Skip this variant for this day on error
                     rows = []
                     break
 
                 ct = r.headers.get("content-type", "")
                 if "application/json" not in ct:
-                    if log is not None:
-                        log.append(f"[{day_str} {v}] non-JSON on page {page} (ct={ct}).")
+                    # Non-JSON => HTML / error page; skip this variant
                     break
 
                 data = r.json()
@@ -342,10 +335,9 @@ run = st.button("🔎 Fetch Announcements", use_container_width=True)
 if run:
     ds = start_date.strftime("%Y%m%d")
     de = end_date.strftime("%Y%m%d")
-    logs = []
 
     with st.spinner("Fetching..."):
-        df = fetch_bse_announcements_strict(ds, de, log=logs)
+        df = fetch_bse_announcements_strict(ds, de)
 
     orders_df = enrich_orders(df)
     capex_df = enrich_capex(df)
