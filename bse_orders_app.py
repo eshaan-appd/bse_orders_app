@@ -41,7 +41,7 @@ def _call_once(s: requests.Session, url: str, params: dict):
     return rows, total, {}
 
 def _fetch_single_range(s, d1: str, d2: str, log):
-    """Fetch full date range without chunking."""
+    """Fetch full date range without chunking (typically used per-day)."""
     search_opts = ["", "P"]
     seg_opts    = ["C", "E"]
     subcat_opts = ["", "-1"]
@@ -66,7 +66,7 @@ def _fetch_single_range(s, d1: str, d2: str, log):
                                 "subcategory": subcategory,
                             }
 
-                            log.append(f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType}")
+                            log.append(f"Trying {ep} | {pageno_key} | {scrip_key} | Type={strType} | {d1}..{d2}")
 
                             rows_acc = []
                             page = 1
@@ -107,29 +107,28 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=N
     """
     Fetch announcements between start_yyyymmdd and end_yyyymmdd (inclusive).
 
-    IMPORTANT:
-    The BSE API is MOST RELIABLE when strPrevDate == strToDate.
-    So we iterate day-by-day and aggregate all results.
+    CHANGE: instead of one big call for the whole range, we iterate
+    day-by-day (BSE is most reliable when strPrevDate == strToDate).
     """
-
     if log is None:
         log = []
 
-    # Create one session & warm it up once
     s = requests.Session()
     s.headers.update(BASE_HEADERS)
 
+    # warmup
     try:
         s.get(HOME, timeout=15)
         s.get(CORP, timeout=15)
     except:
         pass
 
-    # Parse dates
+    # parse dates
     start_dt = pd.to_datetime(start_yyyymmdd, format="%Y%m%d")
     end_dt   = pd.to_datetime(end_yyyymmdd,   format="%Y%m%d")
 
     if end_dt < start_dt:
+        # invalid range -> empty frame
         return pd.DataFrame(columns=[
             "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
             "NEWS_DT","ATTACHMENTNAME","NSURL"
@@ -139,49 +138,44 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str, end_yyyymmdd: str, log=N
 
     cur = start_dt
     while cur <= end_dt:
-        d = cur.strftime("%Y%m%d")
-        log.append(f"Fetching day: {d}")
-        rows = _fetch_single_range(s, d, d, log)
+        d_str = cur.strftime("%Y%m%d")
+        log.append(f"Day fetch: {d_str}..{d_str}")
+        rows = _fetch_single_range(s, d_str, d_str, log)
         if rows:
             all_rows.extend(rows)
         cur += pd.Timedelta(days=1)
 
-    # ---------- no data at all ----------
     if not all_rows:
         return pd.DataFrame(columns=[
             "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
             "NEWS_DT","ATTACHMENTNAME","NSURL"
         ])
 
-    # ---------- build dataframe ----------
-    base_cols = [
-        "SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
-        "NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"
-    ]
+    base_cols = ["SCRIP_CD","SLONGNAME","HEADLINE","NEWSSUB",
+                 "NEWS_DT","ATTACHMENTNAME","NSURL","NEWSID"]
 
     seen = set(base_cols)
-    extra = []
+    extra_cols = []
 
     for r in all_rows:
         for k in r.keys():
             if k not in seen:
-                extra.append(k)
+                extra_cols.append(k)
                 seen.add(k)
 
-    df = pd.DataFrame(all_rows, columns=base_cols + extra)
+    df = pd.DataFrame(all_rows, columns=base_cols + extra_cols)
 
-    # ---------- dedupe ----------
-    keys = ["NSURL","NEWSID","ATTACHMENTNAME","HEADLINE"]
+    keys = ["NSURL", "NEWSID", "ATTACHMENTNAME", "HEADLINE"]
     keys = [k for k in keys if k in df.columns]
+
     if keys:
         df = df.drop_duplicates(subset=keys)
 
-    # ---------- sort ----------
     if "NEWS_DT" in df.columns:
-        df["_dt"] = pd.to_datetime(df["NEWS_DT"], errors="coerce", dayfirst=True)
+        df["_NEWS_DT_PARSED"] = pd.to_datetime(df["NEWS_DT"], errors="coerce", dayfirst=True)
         df = (
-            df.sort_values("_dt", ascending=False)
-              .drop(columns=["_dt"])
+            df.sort_values("_NEWS_DT_PARSED", ascending=False)
+              .drop(columns=["_NEWS_DT_PARSED"])
               .reset_index(drop=True)
         )
 
@@ -258,4 +252,3 @@ if run:
 
     with tab_all:
         st.dataframe(df, use_container_width=True)
-
