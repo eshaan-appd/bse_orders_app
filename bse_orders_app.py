@@ -16,35 +16,69 @@ CORP = "https://www.bseindia.com/corporates/ann.html"
 API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 PDF_BASE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/154.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": CORP,
-    "Connection": "keep-alive",
-}
+HEADER_PROFILES = [
+    {
+        # Matches the request shape used by a currently maintained BSE client.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/153.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Origin": HOME,
+        "Referer": HOME,
+        "Connection": "keep-alive",
+        "Sec-Fetch-Site": "same-site",
+    },
+    {
+        # Fallback: closer to the browser request made from the announcements page.
+        # Deliberately omits Origin because some BSE API gates are header-shape sensitive.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/153.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": CORP,
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-CH-UA": '"Chromium";v="153", "Google Chrome";v="153", "Not_A Brand";v="99"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+    },
+    {
+        # Last fallback: minimal header shape that BSE has historically accepted.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/153.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": HOME,
+    },
+]
 
 # BSE can return a lot of pages. Company Update filtering is the main speed-up.
 CATEGORY = "Company Update"
 SUBCATEGORY = "-1"
 CHUNK_DAYS = 7
-PAGE_PAUSE_SECONDS = 0.15
+PAGE_PAUSE_SECONDS = 0.30
 
 
-def make_session() -> requests.Session:
+def make_session(headers: dict) -> requests.Session:
     s = requests.Session()
-    s.headers.update(HEADERS)
+    s.headers.update(headers)
 
     retry = Retry(
         total=3,
         connect=3,
         read=3,
         status=3,
-        backoff_factor=0.8,
+        backoff_factor=1.0,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
         respect_retry_after_header=True,
@@ -56,49 +90,84 @@ def make_session() -> requests.Session:
     return s
 
 
-def warm_up(s: requests.Session) -> None:
-    """Create cookies/session before calling the API."""
-    for url in (HOME, CORP):
-        try:
-            s.get(url, timeout=12)
-        except requests.RequestException:
-            pass
+class BSEApiClient:
+    """BSE API client that automatically rotates safe browser-style header profiles on 403."""
 
+    def __init__(self, log: list[str] | None = None):
+        self.log = log if log is not None else []
+        self.sessions = [make_session(h) for h in HEADER_PROFILES]
+        self.active_profile = 0
 
-def api_get(s: requests.Session, params: dict) -> dict:
-    """Single resilient BSE API request."""
-    try:
-        r = s.get(API_URL, params=params, timeout=(8, 30))
-    except requests.RequestException as exc:
-        raise RuntimeError(f"BSE request failed: {exc}") from exc
+    def close(self) -> None:
+        for s in self.sessions:
+            s.close()
 
-    # If BSE rejects the current session, refresh cookies once.
-    if r.status_code in (401, 403):
-        warm_up(s)
-        try:
-            r = s.get(API_URL, params=params, timeout=(8, 30))
-        except requests.RequestException as exc:
-            raise RuntimeError(f"BSE retry failed: {exc}") from exc
+    def get_json(self, params: dict) -> dict:
+        last_response = None
+        profile_order = list(range(self.active_profile, len(self.sessions))) + list(range(0, self.active_profile))
 
-    if not r.ok:
-        raise RuntimeError(
-            f"BSE API returned HTTP {r.status_code}. "
-            f"Response: {r.text[:250]!r}"
-        )
+        for idx in profile_order:
+            session = self.sessions[idx]
+            try:
+                r = session.get(API_URL, params=params, timeout=(10, 35), allow_redirects=True)
+            except requests.RequestException as exc:
+                self.log.append(f"Header profile {idx + 1}: request error: {exc}")
+                continue
 
-    # Do not reject only because Content-Type is unusual; attempt JSON parsing.
-    try:
-        return r.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"BSE returned a non-JSON response. "
-            f"Content-Type={r.headers.get('content-type')!r}; "
-            f"Body={r.text[:250]!r}"
-        ) from exc
+            last_response = r
 
+            if r.status_code == 403:
+                self.log.append(
+                    f"Header profile {idx + 1}: HTTP 403 from BSE; trying next request profile."
+                )
+                continue
+
+            if r.status_code in (301, 302, 303, 307, 308):
+                self.log.append(
+                    f"Header profile {idx + 1}: redirect {r.status_code} -> {r.headers.get('location', '')}"
+                )
+
+            if not r.ok:
+                raise RuntimeError(
+                    f"BSE API returned HTTP {r.status_code}. "
+                    f"Response: {r.text[:250]!r}"
+                )
+
+            try:
+                data = r.json()
+            except ValueError as exc:
+                body = r.text[:250]
+                self.log.append(
+                    f"Header profile {idx + 1}: non-JSON response; content-type={r.headers.get('content-type')!r}"
+                )
+                continue
+
+            if not isinstance(data, dict):
+                self.log.append(f"Header profile {idx + 1}: unexpected JSON type {type(data).__name__}")
+                continue
+
+            self.active_profile = idx
+            return data
+
+        if last_response is not None and last_response.status_code == 403:
+            raise RuntimeError(
+                "BSE blocked all request profiles with HTTP 403. "
+                "This is usually an IP/network-level block by BSE's web firewall, not a code syntax issue. "
+                "If this app is deployed on Streamlit Community Cloud, run the same file locally once; "
+                "if local works but Cloud does not, the Cloud server IP is being rejected by BSE. "
+                f"Last response: {last_response.text[:180]!r}"
+            )
+
+        if last_response is not None:
+            raise RuntimeError(
+                "BSE did not return usable JSON. "
+                f"Last HTTP status={last_response.status_code}; body={last_response.text[:180]!r}"
+            )
+
+        raise RuntimeError("BSE request failed for all header profiles.")
 
 def fetch_one_range(
-    s: requests.Session,
+    client: BSEApiClient,
     start_yyyymmdd: str,
     end_yyyymmdd: str,
     log: list[str] | None = None,
@@ -123,7 +192,7 @@ def fetch_one_range(
             "strType": "C",      # equity
         }
 
-        data = api_get(s, params)
+        data = client.get_json(params)
         rows = data.get("Table") or []
 
         if page == 1:
@@ -134,7 +203,8 @@ def fetch_one_range(
 
             log.append(
                 f"{start_yyyymmdd}..{end_yyyymmdd}: "
-                f"reported rows={total_rows if total_rows is not None else 'unknown'}"
+                f"reported rows={total_rows if total_rows is not None else 'unknown'}; "
+                f"header profile={client.active_profile + 1}"
             )
 
         if not rows:
@@ -189,16 +259,18 @@ def fetch_bse_announcements(
     if start_dt > end_dt:
         raise ValueError("Start date cannot be after end date.")
 
-    s = make_session()
-    warm_up(s)
+    client = BSEApiClient(log=log)
 
     all_rows: list[dict] = []
 
-    for chunk_start, chunk_end in iter_date_chunks(start_dt, end_dt):
-        d1 = chunk_start.strftime("%Y%m%d")
-        d2 = chunk_end.strftime("%Y%m%d")
-        log.append(f"Fetching {d1}..{d2}")
-        all_rows.extend(fetch_one_range(s, d1, d2, log))
+    try:
+        for chunk_start, chunk_end in iter_date_chunks(start_dt, end_dt):
+            d1 = chunk_start.strftime("%Y%m%d")
+            d2 = chunk_end.strftime("%Y%m%d")
+            log.append(f"Fetching {d1}..{d2}")
+            all_rows.extend(fetch_one_range(client, d1, d2, log))
+    finally:
+        client.close()
 
     if not all_rows:
         return pd.DataFrame(
@@ -346,6 +418,7 @@ def enrich_capex(df: pd.DataFrame) -> pd.DataFrame:
 # =========================================================
 st.set_page_config(page_title="BSE Order & Capex Announcements", layout="wide")
 st.title("BSE Order & Capex Announcements Finder")
+st.caption("403-resilient BSE request layer • v2")
 
 col1, col2 = st.columns(2)
 with col1:
